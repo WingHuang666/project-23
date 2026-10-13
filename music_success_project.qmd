@@ -1,0 +1,1211 @@
+
+
+# 1. Project Scope and Research Design
+
+This project joins three track-level datasets on `track_id` and investigates five complementary research questions. All supervised predictions use **only audio and release metadata**; chart outcomes are reserved as targets or post-hoc comparisons. This separation reduces direct target leakage, but does not establish causality. In particular, the files lack timestamps for the chart outcomes and listening histories, so truly prospective performance cannot be verified.
+
+**Research questions:**
+
+1. **Longevity:** Can intrinsic audio and metadata attributes predict a track's `longevity_score`?
+2. **Virality:** Can these attributes distinguish tracks labeled as viral hits?
+3. **Chart peak:** Can they predict a track's best chart rank, and how accurate is that prediction?
+4. **Streams:** Can they predict total streams, and does logarithmic transformation improve modeling of a skewed target?
+5. **Profiles:** What audio-based track clusters exist, and how do their subsequent chart outcomes differ?
+
+The candidate supervised algorithms are Dummy baseline, regularized linear/logistic model, Random Forest, Extra Trees, and HistGradientBoosting (five per task). Final selection uses held-out test results **only for reporting**, not for model selection. Selection is based on five-fold cross-validation on the training set. For classification, the selection metric adapts to class prevalence.
+
+# 2. Environment and Data Loading
+
+Put this `.qmd` file in the same folder as the three input CSV files. In VS Code with Quarto and a Python/Jupyter kernel, run all cells or render with `quarto render music_success_project.qmd --to html`. Required packages: `pandas numpy matplotlib seaborn scikit-learn jupyter`.
+
+
+```{python}
+import sys
+import subprocess
+
+packages = [
+    "numpy",
+    "pandas",
+    "matplotlib",
+    "seaborn",
+    "scikit-learn",
+    "scipy"
+]
+
+subprocess.check_call([
+    sys.executable, "-m", "pip", "install", *packages
+])
+```
+
+
+
+
+```{python}
+# Uncomment once if packages are missing:
+# %pip install pandas numpy matplotlib seaborn scikit-learn jupyter
+from pathlib import Path
+import warnings
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+from IPython.display import display
+from sklearn.model_selection import train_test_split, StratifiedKFold, KFold, cross_validate
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.impute import SimpleImputer
+from sklearn.dummy import DummyRegressor, DummyClassifier
+from sklearn.linear_model import Ridge, LogisticRegression
+from sklearn.ensemble import RandomForestRegressor, ExtraTreesRegressor, HistGradientBoostingRegressor
+from sklearn.ensemble import RandomForestClassifier, ExtraTreesClassifier, HistGradientBoostingClassifier
+from sklearn.metrics import (mean_absolute_error, mean_squared_error, r2_score,
+    average_precision_score, roc_auc_score, f1_score, precision_score, recall_score,
+    confusion_matrix, ConfusionMatrixDisplay, silhouette_score)
+from sklearn.inspection import permutation_importance
+from sklearn.cluster import KMeans
+from sklearn.decomposition import PCA
+
+RANDOM_STATE = 42
+sns.set_theme(style='whitegrid', palette='deep', context='notebook')
+DATA_DIR = Path('.')
+files = {
+    'metadata': DATA_DIR / 'track_metadata.csv',
+    'audio': DATA_DIR / 'audio_features.csv',
+    'chart': DATA_DIR / 'chart_longevity_panel.csv'
+}
+for name, path in files.items():
+    if not path.exists():
+        raise FileNotFoundError(f'Missing {name}: {path.resolve()}')
+metadata = pd.read_csv(files['metadata'])
+audio = pd.read_csv(files['audio'])
+chart = pd.read_csv(files['chart'])
+for name, frame in [('metadata', metadata), ('audio', audio), ('chart', chart)]:
+    print(name, 'shape:', frame.shape, '| duplicate track_id:', frame.track_id.duplicated().sum())
+    if frame.track_id.isna().any() or frame.track_id.duplicated().any():
+        raise ValueError(f'{name} requires unique, non-null track_id for a 1:1 merge')
+```
+
+# 3. Data Integration, Validation, and Feature Engineering
+
+A one-to-one inner join is appropriate when every analysis requires all three sources. We explicitly report unmatched IDs before merging rather than silently treating missing tracks as observations with missing features. `release_year`, `release_month`, and `duration_min` are derived from metadata. Titles, artist identifiers, and track IDs are excluded from prediction to avoid memorization and high-cardinality shortcuts.
+
+```{python}
+ids = {name: set(frame.track_id) for name, frame in [('metadata', metadata), ('audio', audio), ('chart', chart)]}
+for name in ids:
+    print(f'IDs only in {name} relative to all three intersection:', len(ids[name] - set.intersection(*ids.values())))
+df = metadata.merge(audio, on='track_id', how='inner', validate='one_to_one').merge(
+    chart, on='track_id', how='inner', validate='one_to_one')
+df['release_date'] = pd.to_datetime(df['release_date'], errors='coerce')
+df['release_year'] = df['release_date'].dt.year
+df['release_month'] = df['release_date'].dt.month
+df['duration_min'] = df['duration_ms'] / 60000
+print('Merged shape:', df.shape)
+print('Missing values:')
+display(df.isna().sum().to_frame('missing_count'))
+display(df.head())
+print('Unique tracks:', df.track_id.nunique())
+print('Viral prevalence:', df.is_viral_hit.value_counts(dropna=False).to_dict())
+print('Target summaries:')
+display(df[['longevity_score', 'is_viral_hit', 'peak_chart_rank',
+            'total_streams_mil', 'weeks_on_top_100']].describe().T)
+```
+
+# 4. Exploratory Data Analysis
+
+These plots answer specific questions: class imbalance, skewness of commercial outcomes, genre differences, and relationships between audio properties and chart performance. Descriptive associations are not causal evidence.
+
+```{python}
+fig, axes = plt.subplots(2, 2, figsize=(13, 9))
+df['is_viral_hit'].value_counts().sort_index().plot.bar(ax=axes[0,0]); axes[0,0].set_title('Viral class balance')
+sns.histplot(data=df, x='total_streams_mil', bins=35, color='steelblue', ax=axes[0,1]); axes[0,1].set_title('Streams: check skewness')
+sns.histplot(data=df, x='longevity_score', bins=35, color='steelblue', ax=axes[1,0]); axes[1,0].set_title('Longevity score distribution')
+sns.scatterplot(data=df, x='weeks_on_top_100', y='longevity_score',
+                alpha=.4, ax=axes[1,1]); axes[1,1].set_title('Chart weeks vs. longevity (descriptive only)')
+plt.tight_layout(); plt.show()
+
+fig, axes = plt.subplots(1, 2, figsize=(14, 5))
+order = df.groupby('genre')['total_streams_mil'].median().sort_values(ascending=False).index
+sns.boxplot(data=df, x='genre', y='total_streams_mil', order=order,
+            showfliers=False, ax=axes[0]); axes[0].tick_params(axis='x', rotation=45)
+axes[0].set_title('Streams by genre (outliers hidden for readability)')
+sns.scatterplot(data=df, x='energy', y='danceability', hue='is_viral_hit',
+                alpha=.6, ax=axes[1]); axes[1].set_title('Audio features vs. viral label')
+plt.tight_layout(); plt.show()
+
+numeric_corr = ['tempo_bpm', 'danceability', 'energy', 'valence', 'acousticness',
+                'liveness', 'duration_min', 'peak_chart_rank', 'weeks_on_top_100',
+                'total_streams_mil', 'longevity_score']
+plt.figure(figsize=(11, 8))
+sns.heatmap(df[numeric_corr].corr(), cmap='vlag', center=0, annot=True, fmt='.2f')
+plt.title('Pairwise correlations: associations, not independent effects')
+plt.tight_layout(); plt.show()
+```
+
+
+### Exploratory Data Analysis — Key Findings
+
+**1. Viral Hit Class Distribution**
+
+The dataset exhibits moderate class imbalance, with non-viral tracks accounting for approximately 72% of observations and viral tracks representing approximately 28%. Therefore, accuracy alone may be misleading when evaluating viral-hit classification models. Average Precision (PR-AUC), F1-score, precision, and recall will provide a more informative evaluation.
+
+**2. Streaming Popularity Distribution**
+
+Total streams exhibit a positively skewed distribution, with most tracks concentrated in the lower-to-middle streaming range and a small number achieving exceptionally high streaming counts. A logarithmic transformation may improve regression stability and reduce the influence of extreme values.
+
+**3. Chart Longevity Distribution**
+
+Longevity scores are concentrated primarily between 0.10 and 0.45, with relatively few observations at the upper end. The variation supports regression-based investigation, although the construction of the target variable must be examined to prevent information leakage.
+
+**4. Chart Duration and Longevity**
+
+A positive association is visible between weeks on the Top 100 chart and longevity scores. However, this relationship may partly reflect how longevity is calculated rather than an independent causal effect. Chart duration should therefore be excluded from longevity prediction if it contributes directly to the target's definition.
+
+**5. Genre and Streaming Performance**
+
+Streaming distributions overlap substantially across musical genres. Although some differences in median streaming performance are visible, within-genre variation remains considerable. This suggests that genre alone is unlikely to provide a complete explanation of commercial popularity.
+
+**6. Audio Characteristics and Viral Success**
+
+Energy and danceability show substantial overlap between viral and non-viral tracks, indicating limited visual separation based on these two variables alone. Multivariate models are needed to determine whether combinations of audio characteristics and metadata improve viral-hit prediction.
+
+### Overall Implications
+
+The exploratory analysis highlights three important modeling considerations: class imbalance in viral-hit classification, right-skewness in streaming outcomes, and potential target leakage in longevity modeling. These findings motivate the use of task-specific evaluation metrics, appropriate transformations, and carefully selected predictor sets.
+
+The analysis identifies associations and predictive patterns rather than causal relationships.
+
+
+
+
+# 5. Modeling Protocol and Shared Helpers
+
+Predictors are limited to variables describing the track itself and its release. We do **not** use `weeks_on_top_100`, `peak_chart_rank`, `total_streams_mil`, `longevity_score`, or `is_viral_hit` to predict one another. We also exclude `artist_name` and `track_title`: artist identity can encode pre-existing fame, while synthetic titles may be arbitrary. One-hot encoding and scaling are fit inside each training fold. Regression selects lowest CV MAE; classification selects CV average precision when the positive class is rare (prevalence below 20%), otherwise CV ROC-AUC. We additionally report F1, recall and precision using a threshold chosen only from out-of-fold training probabilities. This is an exploratory model comparison, not a causal design.
+
+```{python}
+feature_cols = ['genre', 'is_explicit', 'duration_min', 'release_year', 'release_month',
+                'tempo_bpm', 'danceability', 'energy', 'valence', 'acousticness',
+                'liveness', 'musical_key', 'mode']
+X = df[feature_cols].copy()
+cat_cols = ['genre', 'musical_key', 'mode']
+num_cols = [c for c in feature_cols if c not in cat_cols]
+
+def preprocessing():
+    return ColumnTransformer([
+        ('numeric', Pipeline([('imputer', SimpleImputer(strategy='median')),
+                              ('scale', StandardScaler())]), num_cols),
+        ('categorical', Pipeline([('imputer', SimpleImputer(strategy='most_frequent')),
+                                  ('onehot', OneHotEncoder(handle_unknown='ignore', sparse_output=False))]), cat_cols)
+    ], sparse_threshold=0)
+
+def regression_candidates():
+    return {
+        'Dummy median': DummyRegressor(strategy='median'),
+        'Ridge': Ridge(alpha=10),
+        'Random Forest': RandomForestRegressor(n_estimators=150, min_samples_leaf=3, random_state=RANDOM_STATE, n_jobs=-1),
+        'Extra Trees': ExtraTreesRegressor(n_estimators=150, min_samples_leaf=3, random_state=RANDOM_STATE, n_jobs=-1),
+        'HistGradientBoosting': HistGradientBoostingRegressor(max_iter=120, l2_regularization=2, random_state=RANDOM_STATE)
+    }
+
+def classification_candidates():
+    return {
+        'Dummy prior': DummyClassifier(strategy='prior'),
+        'Logistic Regression': LogisticRegression(max_iter=2000, class_weight='balanced'),
+        'Random Forest': RandomForestClassifier(n_estimators=150, min_samples_leaf=3, class_weight='balanced', random_state=RANDOM_STATE, n_jobs=-1),
+        'Extra Trees': ExtraTreesClassifier(n_estimators=150, min_samples_leaf=3, class_weight='balanced', random_state=RANDOM_STATE, n_jobs=-1),
+        'HistGradientBoosting': HistGradientBoostingClassifier(max_iter=120, l2_regularization=2, random_state=RANDOM_STATE)
+    }
+
+def importance_plot(model, X_test, y_test, scoring, title):
+    pi = permutation_importance(model, X_test, y_test, scoring=scoring,
+                                n_repeats=8, random_state=RANDOM_STATE, n_jobs=-1)
+    vals = pd.Series(pi.importances_mean, index=X_test.columns).sort_values(ascending=False)
+    display(vals.head(12).rename('mean_score_decrease').to_frame())
+    vals.head(12).sort_values().plot.barh(figsize=(8, 5), title=title)
+    plt.xlabel('Decrease in held-out model score after permutation')
+    plt.tight_layout(); plt.show()
+    return vals
+
+def run_regression(target, title, log_target=False):
+    valid = df[target].notna()
+    if log_target and (df.loc[valid, target] < 0).any():
+        raise ValueError('Log target must be nonnegative')
+    xx, yy = X.loc[valid], df.loc[valid, target]
+    xtr, xte, ytr, yte = train_test_split(xx, yy, test_size=.2, random_state=RANDOM_STATE)
+    fit_y = np.log1p(ytr) if log_target else ytr
+    cv = KFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    rows = []
+    for name, estimator in regression_candidates().items():
+        pipe = Pipeline([('preprocess', preprocessing()), ('model', estimator)])
+        # Original-scale MAE is essential when the target is log-transformed.
+        if log_target:
+            from sklearn.model_selection import cross_val_predict
+
+            oof = cross_val_predict(
+                pipe, xtr, fit_y, cv=cv, n_jobs=-1
+            )
+
+            # Convert predictions back to the original scale
+            # and ensure non-negative stream predictions.
+            original_predictions = np.maximum(0, np.expm1(oof))
+
+            cv_mae = mean_absolute_error(ytr, original_predictions)
+            cv_rmse = np.sqrt(mean_squared_error(ytr, original_predictions))
+        else:
+            scores = cross_validate(pipe, xtr, fit_y, cv=cv,
+                scoring={'mae':'neg_mean_absolute_error','mse':'neg_mean_squared_error'}, n_jobs=-1)
+            cv_mae = -scores['test_mae'].mean()
+            cv_rmse = np.sqrt(-scores['test_mse'].mean())
+        rows.append({'Model':name,'CV MAE':cv_mae,'CV RMSE':cv_rmse})
+    results = pd.DataFrame(rows).sort_values('CV MAE').reset_index(drop=True)
+    display(results.round(4))
+    best_name = results.iloc[0]['Model']
+    best = Pipeline([('preprocess', preprocessing()), ('model', regression_candidates()[best_name])])
+    best.fit(xtr, fit_y)
+    pred = best.predict(xte)
+    if log_target: pred = np.maximum(0, np.expm1(pred))
+    print(f'{title} | selected: {best_name} | test MAE: {mean_absolute_error(yte,pred):.4f} | test RMSE: {np.sqrt(mean_squared_error(yte,pred)):.4f} | test R2: {r2_score(yte,pred):.4f}')
+    fig, ax = plt.subplots(figsize=(6, 5))
+    ax.scatter(yte, pred, alpha=.55)
+    lo = min(yte.min(), pred.min()); hi = max(yte.max(), pred.max())
+    ax.plot([lo,hi],[lo,hi], 'k--'); ax.set(xlabel='Actual', ylabel='Predicted', title=title + ': held-out predictions')
+    plt.tight_layout(); plt.show()
+    # Importance must be measured on the original outcome scale for log models.
+    from sklearn.metrics import make_scorer
+    if log_target:
+        from sklearn.base import BaseEstimator, RegressorMixin
+
+        class OriginalScalePredictor(RegressorMixin, BaseEstimator):
+            def __init__(self, fitted):
+                self.fitted = fitted
+
+            def fit(self, X, y=None):
+                # The underlying pipeline has already been fitted.
+                return self
+
+            def predict(self, X):
+                log_predictions = self.fitted.predict(X)
+                return np.maximum(0, np.expm1(log_predictions))
+
+        importance_model = OriginalScalePredictor(best)
+
+    else:
+        importance_model = best
+    imp = importance_plot(importance_model, xte, yte, 'neg_mean_absolute_error', title + ': permutation importance')
+    return {'comparison':results, 'best_name':best_name, 'model':best,
+            'test_mae':mean_absolute_error(yte,pred),'test_r2':r2_score(yte,pred),'importance':imp}
+```
+
+
+
+
+# 6. RQ1 — Can Track Characteristics Predict Chart Longevity?
+
+**Why this matters.** A durable chart presence is distinct from an initial burst of attention. We predict the provided longevity score without using other observed chart outcomes. MAE is primary because it is interpretable in the target's native units; RMSE additionally penalizes large errors, while R² compares against a constant prediction. The exact construction of `longevity_score` is not supplied, so its substantive meaning cannot be independently validated.
+
+```{python}
+rq1 = run_regression('longevity_score', 'RQ1: Longevity score')
+```
+
+
+### RQ1 — Model Comparison and Interpretation
+
+Five models were evaluated using cross-validation, with Mean Absolute Error (MAE) as the primary selection metric and Root Mean Squared Error (RMSE) as a secondary metric.
+
+The Dummy Median baseline achieved the lowest CV MAE (0.1068) and CV RMSE (0.1264), outperforming Ridge Regression, Random Forest, Extra Trees, and HistGradientBoosting.
+
+Ridge Regression was the strongest non-baseline model, with a CV MAE of 0.1083. However, its performance did not exceed that of the baseline.
+
+These findings suggest that the available predictors provide limited incremental predictive value for chart longevity under the current modeling framework. More complex algorithms did not produce measurable improvements over a constant-median prediction.
+
+The Dummy Median model was therefore selected according to the predefined MAE criterion. However, the differences between models are relatively small, and additional validation would be necessary to establish whether they are statistically meaningful.
+
+**Conclusion:** The current feature set does not demonstrate sufficient predictive signal to outperform a simple baseline for chart longevity. This is a meaningful negative finding rather than evidence that chart longevity is inherently unpredictable.
+
+
+
+### RQ1 — Held-Out Predictions and Feature Importance
+
+The selected Dummy Median model produces an approximately constant longevity prediction of 0.285 for all observations in the held-out test set.
+
+The actual-versus-predicted scatter plot therefore forms a horizontal line rather than following the ideal diagonal reference line. This indicates that the model systematically overestimates tracks with low longevity scores and underestimates tracks with high longevity scores.
+
+The permutation importance analysis assigns a value of zero to every predictor, including genre, duration, energy, danceability, tempo, and release year. This outcome is expected because Dummy Median does not use any input features when generating predictions.
+
+Consequently, the zero importance scores should not be interpreted as evidence that these musical characteristics have no relationship with chart longevity. They indicate only that the selected baseline model does not depend on these variables.
+
+Although Dummy Median achieved the lowest cross-validation errors, its predictions cannot distinguish between tracks with different longevity outcomes.
+
+**Conclusion:** The available feature set and evaluated machine learning models did not outperform a constant-median baseline. This suggests limited demonstrated predictive value for chart longevity under the current modeling framework. Further research could incorporate promotional activity, playlist exposure, artist popularity, and audience engagement to investigate whether additional information improves predictions.
+
+
+
+
+```{python}
+# RQ1 — Supplementary Ridge Feature Importance Analysis
+
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+from sklearn.inspection import permutation_importance
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# 1. Recreate the original RQ1 train/test split
+valid = df["longevity_score"].notna()
+
+X_rq1 = X.loc[valid]
+y_rq1 = df.loc[valid, "longevity_score"]
+
+X_train, X_test, y_train, y_test = train_test_split(
+    X_rq1,
+    y_rq1,
+    test_size=0.2,
+    random_state=RANDOM_STATE
+)
+
+# 2. Build the Ridge pipeline
+ridge_model = Pipeline([
+    ("preprocess", preprocessing()),
+    ("model", regression_candidates()["Ridge"])
+])
+
+# 3. Train Ridge
+ridge_model.fit(X_train, y_train)
+
+# 4. Calculate permutation importance
+ridge_importance = permutation_importance(
+    ridge_model,
+    X_test,
+    y_test,
+    scoring="neg_mean_absolute_error",
+    n_repeats=20,
+    random_state=RANDOM_STATE,
+    n_jobs=-1
+)
+
+# 5. Create feature importance table
+ridge_feature_importance = pd.DataFrame({
+    "Feature": X_test.columns,
+    "Mean Score Decrease": ridge_importance.importances_mean,
+    "Std": ridge_importance.importances_std
+}).sort_values(
+    "Mean Score Decrease",
+    ascending=False
+)
+
+display(ridge_feature_importance.round(6))
+
+# 6. Visualize feature importance
+plt.figure(figsize=(9, 6))
+
+plot_data = ridge_feature_importance.sort_values(
+    "Mean Score Decrease"
+)
+
+plt.barh(
+    plot_data["Feature"],
+    plot_data["Mean Score Decrease"],
+    xerr=plot_data["Std"],
+    capsize=3
+)
+
+plt.axvline(0, color="black", linestyle="--")
+
+plt.xlabel("Mean Decrease in Model Score (MAE)")
+plt.ylabel("Feature")
+plt.title("RQ1: Ridge Regression — Permutation Feature Importance")
+
+plt.tight_layout()
+plt.show()
+```
+
+
+### RQ1 — Supplementary Ridge Feature Importance Analysis
+
+Although Dummy Median was selected as the best-performing model, Ridge Regression was examined as a supplementary model to investigate the predictive contribution of individual features.
+
+Permutation importance was calculated on the held-out test set using negative mean absolute error, with 20 repetitions per feature.
+
+Musical key exhibited the highest positive mean permutation importance (0.000243), followed by track duration (0.000134) and tempo (0.000083). However, these values were extremely small relative to the model's overall prediction error. Musical key also exhibited considerable variability across permutations.
+
+Danceability (-0.000538), release year (-0.000336), and genre (-0.000322) showed the most negative mean importance values. These negative values indicate that randomly permuting these features slightly improved the model's predictive performance on the held-out data. They do not imply negative relationships between the features and chart longevity.
+
+Most features exhibited substantial variability across repeated permutations, suggesting that their estimated contributions are not particularly stable. The reported standard deviations describe variation across permutations rather than statistical confidence intervals.
+
+Importantly, Ridge Regression did not outperform the Dummy Median baseline, achieving a CV MAE of 0.1083 compared with 0.1068 for Dummy Median.
+
+**Conclusion:** The supplementary analysis provides little evidence that individual audio or metadata features contribute substantial, stable predictive information for chart longevity. Although musical key had the highest positive mean importance, its contribution was small and variable. These findings reinforce the conclusion that the evaluated models did not meaningfully improve upon the baseline.
+
+
+
+
+
+# 7. RQ2 — Can Track Characteristics Identify Viral Hits?
+
+**Why this matters.** Viral success may be driven by distribution, timing, promotion, and network effects not represented in the files. Class prevalence determines the primary metric: PR-AUC (average precision) is preferred for rare positives; otherwise ROC-AUC. Threshold-dependent precision, recall, and F1 are also reported. The positive class must contain at least five examples to support stratified five-fold CV.
+
+```{python}
+y = df['is_viral_hit'].astype(int)
+counts = y.value_counts()
+if set(y.unique()) != {0,1} or counts.min() < 7:
+    print('RQ2 cannot be reliably evaluated: both classes and at least 7 samples per class are required.')
+    rq2 = None
+else:
+    xtr, xte, ytr, yte = train_test_split(X, y, test_size=.2, stratify=y, random_state=RANDOM_STATE)
+    cv = StratifiedKFold(n_splits=5, shuffle=True, random_state=RANDOM_STATE)
+    metric = 'average_precision' if ytr.mean() < .20 else 'roc_auc'
+    rows = []
+    for name, estimator in classification_candidates().items():
+        pipe = Pipeline([('preprocess', preprocessing()), ('model', estimator)])
+        scores = cross_validate(pipe, xtr, ytr, cv=cv,
+            scoring={'ap':'average_precision','auc':'roc_auc'}, n_jobs=-1)
+        rows.append({'Model':name, 'CV PR-AUC':scores['test_ap'].mean(), 'CV ROC-AUC':scores['test_auc'].mean()})
+    comp = pd.DataFrame(rows).sort_values('CV PR-AUC' if metric=='average_precision' else 'CV ROC-AUC', ascending=False).reset_index(drop=True)
+    display(comp.round(4))
+    winner = comp.iloc[0]['Model']
+    best = Pipeline([('preprocess', preprocessing()), ('model', classification_candidates()[winner])])
+    from sklearn.model_selection import cross_val_predict
+    oof_prob = cross_val_predict(best, xtr, ytr, cv=cv, method='predict_proba', n_jobs=-1)[:,1]
+    thresholds = np.linspace(.05, .95, 91)
+    f1s = [f1_score(ytr, oof_prob >= t, zero_division=0) for t in thresholds]
+    threshold = float(thresholds[np.argmax(f1s)])
+    best.fit(xtr, ytr)
+    prob = best.predict_proba(xte)[:,1]
+    predicted = (prob >= threshold).astype(int)
+    print('Selected:',winner,'| selection metric:',metric,'| training-only threshold:',round(threshold,2))
+    print('Test PR-AUC:',round(average_precision_score(yte,prob),4),
+          '| ROC-AUC:',round(roc_auc_score(yte,prob),4),
+          '| F1:',round(f1_score(yte,predicted,zero_division=0),4),
+          '| precision:',round(precision_score(yte,predicted,zero_division=0),4),
+          '| recall:',round(recall_score(yte,predicted,zero_division=0),4))
+    ConfusionMatrixDisplay.from_predictions(yte,predicted)
+    plt.title('RQ2: Held-out confusion matrix'); plt.show()
+    importance = importance_plot(best, xte, yte, metric, 'RQ2: permutation importance')
+    rq2 = {'comparison':comp,'best_name':winner,'model':best,'threshold':threshold,'importance':importance}
+```
+
+
+
+### RQ2 — Model Comparison and Interpretation
+
+Five classification models were evaluated using cross-validation, with Average Precision (PR-AUC) as the primary selection metric and ROC-AUC as a secondary metric.
+
+Random Forest achieved the highest CV PR-AUC of 0.3999, outperforming HistGradientBoosting (0.3862), Logistic Regression (0.3647), Extra Trees (0.3620), and the Dummy Prior baseline (0.2865).
+
+The improvement over the baseline represents an approximately 39.6% relative increase in Average Precision, suggesting that the available predictors contain some useful information for identifying viral hits.
+
+HistGradientBoosting achieved the highest ROC-AUC (0.6028), compared with 0.5895 for Random Forest. However, Random Forest was selected because PR-AUC was the predefined primary metric, reflecting the study's emphasis on identifying the positive class under moderate class imbalance.
+
+Despite outperforming the baseline, the selected model's performance remains modest. The relatively low ROC-AUC indicates limited discrimination between viral and non-viral tracks.
+
+Furthermore, the difference in PR-AUC between Random Forest and HistGradientBoosting is small, and additional validation would be required to determine whether this difference is stable.
+
+**Conclusion:** Audio characteristics and track metadata provide modest predictive information for viral-hit classification, but they are insufficient for highly reliable identification of viral success. Random Forest was selected as the best-performing model under the predefined evaluation criterion.
+
+
+
+### RQ2 — Permutation Feature Importance Analysis
+
+Permutation feature importance was used to investigate which audio characteristics and metadata variables contributed most to the selected Random Forest classifier.
+
+Danceability exhibited the highest mean importance (0.027852), followed closely by tempo (0.026602) and acousticness (0.019461). These results indicate that the classifier relies most heavily on these three features when distinguishing viral from non-viral tracks.
+
+Energy (0.012819) and genre (0.012427) also contributed positively to predictive performance, while mode (0.007765) and valence (0.006992) demonstrated smaller contributions.
+
+In contrast, liveness and musical key exhibited importance values close to zero. Track duration (-0.004163), release year (-0.002733), and explicit-content status (-0.001398) showed negative mean permutation importance, indicating that shuffling these variables slightly improved the model's evaluation score on the assessment data.
+
+These negative values should not be interpreted as negative associations with viral success. Similarly, positive permutation importance does not establish that higher feature values increase the probability of becoming viral.
+
+The importance rankings describe the behavior of the fitted Random Forest classifier rather than causal relationships. Correlations among predictors and sampling variability may also influence the results.
+
+Compared with RQ1, where no evaluated model outperformed the baseline, RQ2 demonstrates modest predictive information from the available features. However, the selected Random Forest achieved only moderate-to-weak classification performance (CV PR-AUC = 0.3999; CV ROC-AUC = 0.5895).
+
+**Conclusion:** Danceability, tempo, and acousticness were the most useful predictors within the selected Random Forest model. Nevertheless, the model's limited overall discrimination suggests that musical characteristics alone are insufficient for highly reliable viral-hit prediction.
+
+
+
+
+
+
+
+# 8. RQ3 — Can Track Characteristics Predict Peak Chart Rank?
+
+**Why this matters.** A smaller rank number indicates a better chart position. We use MAE in rank places as the primary metric; a low MAE is useful, while negative R² indicates performance worse than a constant baseline. The model predicts the numerical rank as a regression target, even though rank is bounded and ordinal; predictions outside the chart range are not inherently valid ranks.
+
+```{python}
+rq3 = run_regression('peak_chart_rank', 'RQ3: Peak chart rank')
+```
+
+
+
+### RQ3 — Model Comparison and Interpretation
+
+Five regression models were evaluated to predict the best chart position achieved by each track. Mean Absolute Error (MAE) was used as the primary evaluation metric, while Root Mean Squared Error (RMSE) was used as a secondary metric to assess larger prediction errors.
+
+The Dummy Median baseline achieved the lowest CV MAE (24.9396) and CV RMSE (28.8986), outperforming all four machine learning models.
+
+Ridge Regression was the strongest non-baseline model, with a CV MAE of 25.1626 and CV RMSE of 29.3133. Random Forest, Extra Trees, and HistGradientBoosting produced progressively higher errors.
+
+The selected Dummy Median model predicts a constant chart position based on the median rank observed in the training data. Its MAE indicates an average prediction error of approximately 25 chart positions.
+
+Although the more complex models incorporated audio characteristics and track metadata, none demonstrated an improvement over the baseline. This suggests that the available predictors provide limited incremental information for estimating peak chart rank.
+
+Because the selected model does not use input features, its permutation feature importance values would all be zero. Any feature importance analysis using Ridge Regression should therefore be presented as supplementary and exploratory.
+
+**Conclusion:** The evaluated audio and metadata features did not improve peak chart rank prediction beyond a constant-median baseline. More comprehensive information, such as promotional exposure, artist popularity, playlist placement, and audience engagement, may be necessary to improve predictive performance. These additional factors were not evaluated in the present study.
+
+
+
+
+```{python}
+# RQ3 — Supplementary Ridge Feature Importance Analysis
+
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+from sklearn.inspection import permutation_importance
+import pandas as pd
+import matplotlib.pyplot as plt
+
+# 1. Prepare RQ3 data
+valid = df["peak_chart_rank"].notna()
+
+X_rq3 = X.loc[valid]
+y_rq3 = df.loc[valid, "peak_chart_rank"]
+
+# 2. Recreate the original train/test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X_rq3,
+    y_rq3,
+    test_size=0.2,
+    random_state=RANDOM_STATE
+)
+
+# 3. Build the Ridge pipeline
+ridge_rq3 = Pipeline([
+    ("preprocess", preprocessing()),
+    ("model", regression_candidates()["Ridge"])
+])
+
+# 4. Train the model
+ridge_rq3.fit(X_train, y_train)
+
+# 5. Calculate permutation importance
+rq3_importance = permutation_importance(
+    ridge_rq3,
+    X_test,
+    y_test,
+    scoring="neg_mean_absolute_error",
+    n_repeats=20,
+    random_state=RANDOM_STATE,
+    n_jobs=-1
+)
+
+# 6. Create the feature importance table
+rq3_feature_importance = pd.DataFrame({
+    "Feature": X_test.columns,
+    "Mean Score Decrease": rq3_importance.importances_mean,
+    "Std": rq3_importance.importances_std
+}).sort_values(
+    "Mean Score Decrease",
+    ascending=False
+)
+
+display(rq3_feature_importance.round(6))
+
+# 7. Visualize feature importance
+plot_data = rq3_feature_importance.sort_values(
+    "Mean Score Decrease"
+)
+
+plt.figure(figsize=(10, 6))
+
+plt.barh(
+    plot_data["Feature"],
+    plot_data["Mean Score Decrease"],
+    xerr=plot_data["Std"],
+    capsize=3
+)
+
+plt.axvline(0, color="black", linestyle="--")
+
+plt.xlabel("Increase in MAE After Permutation (Rank Positions)")
+plt.ylabel("Feature")
+plt.title("RQ3: Ridge Regression — Permutation Feature Importance")
+
+plt.tight_layout()
+plt.show()
+```
+
+
+### RQ3 — Supplementary Ridge Feature Importance Interpretation
+
+Permutation feature importance was calculated for Ridge Regression to investigate the potential contribution of audio characteristics and track metadata to peak chart rank prediction.
+
+Musical key exhibited the highest mean permutation importance (0.237540), followed by track duration (0.114791), tempo (0.050414), and energy (0.048962).
+
+These positive values indicate that permuting the corresponding features increased prediction error on the held-out test set. However, their magnitudes were small relative to the overall cross-validation MAE of approximately 25 chart positions.
+
+Genre (0.040359) and danceability (0.036485) also demonstrated small positive contributions. Genre exhibited relatively high variability across repeated permutations, indicating uncertainty in its estimated importance.
+
+In contrast, release year (-0.051835), liveness (-0.040928), release month (-0.007132), and explicit-content status (-0.000604) exhibited negative mean importance values. These results indicate that shuffling these features slightly improved the fitted Ridge model's performance on the assessment data.
+
+Importantly, permutation importance measures changes in predictive performance rather than the direction of association between a feature and chart rank.
+
+Furthermore, Ridge Regression did not outperform the Dummy Median baseline, achieving a CV MAE of 25.1626 compared with 24.9396 for the baseline.
+
+The analysis is therefore exploratory. The reported feature rankings do not establish that musical key or other audio characteristics reliably predict peak chart positions.
+
+### Conclusion
+
+Musical key and track duration exhibited the highest positive permutation importance within the supplementary Ridge model, but their contributions were small relative to the overall prediction error.
+
+The failure of all evaluated machine learning models to outperform the baseline suggests that the available audio and metadata features provide limited demonstrated predictive value for peak chart rank.
+
+The results also highlight the importance of distinguishing model-specific feature importance from robust predictive evidence and causal relationships.
+
+
+
+# 9. RQ4 — Can Track Characteristics Predict Streaming Volume?
+
+**Why this matters.** Streams are typically right-skewed, so we train models on `log1p(total_streams_mil)` and invert predictions to evaluate **original-scale** MAE, RMSE, and R². This is a modeling transformation, not evidence that streams grow logarithmically. These are retrospective total streams; no observation horizon is available, limiting interpretation as a forward forecast.
+
+```{python}
+rq4 = run_regression('total_streams_mil', 'RQ4: Total streams (millions)', log_target=True)
+```
+
+
+### RQ4 — Model Comparison and Interpretation
+
+Five regression models were evaluated to predict total streaming popularity, measured in millions of streams. A logarithmic transformation was applied to the regression target to reduce the influence of highly streamed tracks, while model performance was evaluated on the original streaming scale.
+
+Mean Absolute Error (MAE) was used as the primary model selection criterion, with Root Mean Squared Error (RMSE) as a secondary metric.
+
+The Dummy Median baseline achieved the lowest CV MAE (128.7049 million streams) and CV RMSE (168.4552 million streams), outperforming all four machine learning models.
+
+Ridge Regression was the strongest non-baseline model, achieving a CV MAE of 133.1784 million streams and CV RMSE of 175.4637 million streams.
+
+Extra Trees (135.8755), Random Forest (135.9493), and HistGradientBoosting (147.2504) produced higher cross-validation MAE values.
+
+The selected baseline's MAE corresponds to an average absolute prediction error of approximately 128.7 million streams, indicating substantial uncertainty in individual streaming predictions.
+
+Despite the logarithmic transformation and the use of nonlinear machine learning algorithms, none of the evaluated models demonstrated an improvement over the baseline.
+
+These findings suggest that the available audio characteristics and track metadata provide limited incremental predictive information for total streaming counts under the current modeling framework.
+
+### Conclusion
+
+Dummy Median was selected as the best-performing model according to the predefined MAE criterion.
+
+The results indicate that audio and metadata features alone did not improve streaming popularity prediction beyond a constant-median baseline. Additional factors, such as artist popularity, promotional exposure, playlist placement, and audience engagement, may be important but were not evaluated in this study.
+
+This result should not be interpreted as evidence that audio characteristics have no relationship with streaming popularity. Rather, the evaluated models failed to demonstrate reliable predictive improvement using the available features.
+
+
+
+```{python}
+# RQ4 — Supplementary Ridge Feature Importance Analysis
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+
+from sklearn.pipeline import Pipeline
+from sklearn.model_selection import train_test_split
+from sklearn.inspection import permutation_importance
+from sklearn.metrics import mean_absolute_error
+
+# 1. Prepare the original RQ4 dataset
+valid = df["total_streams_mil"].notna()
+
+X_rq4 = X.loc[valid]
+y_rq4 = df.loc[valid, "total_streams_mil"]
+
+# 2. Recreate the original RQ4 train/test split
+X_train, X_test, y_train, y_test = train_test_split(
+    X_rq4,
+    y_rq4,
+    test_size=0.2,
+    random_state=RANDOM_STATE
+)
+
+# 3. Build the Ridge pipeline
+ridge_rq4 = Pipeline([
+    ("preprocess", preprocessing()),
+    ("model", regression_candidates()["Ridge"])
+])
+
+# 4. Train Ridge on the log-transformed target
+ridge_rq4.fit(X_train, np.log1p(y_train))
+
+# 5. Define a scorer on the original streaming scale
+def original_scale_neg_mae(estimator, X_data, y_true):
+    log_predictions = estimator.predict(X_data)
+
+    original_predictions = np.maximum(
+        0, np.expm1(log_predictions)
+    )
+
+    return -mean_absolute_error(
+        y_true, original_predictions
+    )
+
+# 6. Calculate permutation importance
+rq4_importance = permutation_importance(
+    ridge_rq4,
+    X_test,
+    y_test,
+    scoring=original_scale_neg_mae,
+    n_repeats=20,
+    random_state=RANDOM_STATE,
+    n_jobs=-1
+)
+
+# 7. Create the feature importance table
+rq4_feature_importance = pd.DataFrame({
+    "Feature": X_test.columns,
+    "Mean Score Decrease": rq4_importance.importances_mean,
+    "Std": rq4_importance.importances_std
+}).sort_values(
+    "Mean Score Decrease",
+    ascending=False
+)
+
+display(rq4_feature_importance.round(6))
+
+# 8. Visualize feature importance
+plot_data = rq4_feature_importance.sort_values(
+    "Mean Score Decrease"
+)
+
+plt.figure(figsize=(10, 6))
+
+plt.barh(
+    plot_data["Feature"],
+    plot_data["Mean Score Decrease"],
+    xerr=plot_data["Std"],
+    capsize=3
+)
+
+plt.axvline(
+    0,
+    color="black",
+    linestyle="--"
+)
+
+plt.xlabel(
+    "Increase in MAE After Permutation (Million Streams)"
+)
+
+plt.ylabel("Feature")
+
+plt.title(
+    "RQ4: Ridge Regression — Permutation Feature Importance"
+)
+
+plt.tight_layout()
+plt.show()
+```
+
+
+### RQ4 — Supplementary Ridge Feature Importance Interpretation
+
+Permutation feature importance was calculated for Ridge Regression to investigate the predictive contribution of individual audio characteristics and track metadata to total streaming popularity.
+
+The Ridge model was trained on log-transformed streaming counts, while permutation importance was evaluated using mean absolute error on the original streaming scale.
+
+Danceability exhibited the highest positive mean importance (0.726416 million streams), followed by release year (0.303958 million) and track duration (0.244838 million).
+
+However, these contributions were small relative to Ridge Regression's overall cross-validation MAE of 133.1784 million streams. Furthermore, the standard deviations for all three leading features exceeded their respective mean importance values, indicating considerable variability across repeated permutations.
+
+Several features exhibited negative mean importance, particularly liveness (-1.582569 million), musical key (-0.877019 million), and tempo (-0.368233 million). These results indicate that randomly permuting these features improved prediction performance on the held-out evaluation data.
+
+Negative permutation importance does not imply a negative relationship between a feature and streaming popularity. Such values may reflect model instability, redundant predictors, noise, or limited generalization.
+
+Importantly, Ridge Regression did not outperform the Dummy Median baseline. Ridge achieved a CV MAE of 133.1784 million streams, compared with 128.7049 million for Dummy Median.
+
+### Conclusion
+
+Danceability, release year, and track duration exhibited the highest positive mean permutation importance within the supplementary Ridge model. Nevertheless, their estimated contributions were small and variable.
+
+The results provide limited evidence of stable predictive contributions from individual audio or metadata features to total streaming counts.
+
+The failure of Ridge and other evaluated machine learning models to outperform the baseline reinforces the conclusion that the available predictors did not substantially improve streaming popularity prediction under the current modeling framework.
+
+These findings should be interpreted as model-specific predictive results rather than causal evidence about the determinants of commercial success.
+
+
+
+
+# 10. RQ5 — Are There Distinct Audio Profiles?
+
+Clustering uses **only audio properties** so the clusters are not defined by success metrics. Standardized continuous audio features enter K-Means; key/mode are omitted to avoid imposing artificial numeric distances on musical categories. We inspect inertia (elbow), silhouette, cluster sizes, and interpretability jointly. A modest silhouette score does not automatically invalidate meaningful segments; a very small cluster or a weak elbow is reason for caution.
+
+```{python}
+cluster_features = ['tempo_bpm','danceability','energy','valence','acousticness','liveness']
+Z_raw = df[cluster_features].copy()
+Z = StandardScaler().fit_transform(SimpleImputer(strategy='median').fit_transform(Z_raw))
+k_candidates = list(range(2, min(10, len(df)-1)+1))
+rows = []
+for k in k_candidates:
+    km = KMeans(n_clusters=k, n_init=20, random_state=RANDOM_STATE)
+    labels = km.fit_predict(Z)
+    rows.append({'k':k, 'inertia':km.inertia_,
+                 'silhouette':silhouette_score(Z,labels),
+                 'smallest_cluster':pd.Series(labels).value_counts().min()})
+k_table = pd.DataFrame(rows)
+display(k_table.round(4))
+fig, axes = plt.subplots(1,2,figsize=(12,4))
+axes[0].plot(k_table.k,k_table.inertia,'o-'); axes[0].set(title='Elbow: within-cluster inertia',xlabel='k',ylabel='Inertia')
+axes[1].plot(k_table.k,k_table.silhouette,'o-'); axes[1].set(title='Silhouette vs. k',xlabel='k',ylabel='Silhouette')
+plt.tight_layout(); plt.show()
+
+# Explicit, reproducible joint heuristic:
+# Choose the smallest k within 0.02 of the maximum silhouette among
+# candidates with at least 2% of samples in every cluster, then check the elbow.
+min_cluster_size = max(2, int(np.ceil(.02*len(df))))
+acceptable = k_table[k_table.smallest_cluster >= min_cluster_size].copy()
+if acceptable.empty:
+    acceptable = k_table.copy()
+near_best = acceptable[acceptable.silhouette >= acceptable.silhouette.max()-.02]
+# Use the discrete second difference of inertia to locate an elbow candidate.
+inertias = k_table.inertia.to_numpy()
+if len(inertias) >= 3:
+    elbow_k = int(k_table.k.iloc[np.argmax(inertias[:-2]-2*inertias[1:-1]+inertias[2:])+1])
+else:
+    elbow_k = 2
+selected_k = int(near_best.iloc[(near_best.k-elbow_k).abs().argmin()].k)
+print('Elbow candidate:',elbow_k,'| near-best silhouette candidates:',near_best.k.tolist(),
+      '| selected k:',selected_k)
+print('Decision rule: among k with acceptable cluster sizes and silhouette within 0.02 of maximum, choose closest to elbow.')
+km = KMeans(n_clusters=selected_k,n_init=20,random_state=RANDOM_STATE)
+df['cluster'] = km.fit_predict(Z)
+print('Cluster sizes:'); display(df.cluster.value_counts().sort_index().to_frame('tracks'))
+profile = df.groupby('cluster')[cluster_features + ['total_streams_mil','longevity_score',
+            'weeks_on_top_100','peak_chart_rank','is_viral_hit']].mean()
+display(profile.round(3))
+plt.figure(figsize=(10,5))
+profile_z = (profile[cluster_features]-df[cluster_features].mean())/df[cluster_features].std().replace(0,np.nan)
+sns.heatmap(profile_z, annot=True, fmt='.2f', cmap='vlag', center=0)
+plt.title('Cluster audio profiles (standardized differences)'); plt.tight_layout(); plt.show()
+projection = PCA(n_components=2,random_state=RANDOM_STATE).fit_transform(Z)
+plt.figure(figsize=(8,6))
+sns.scatterplot(x=projection[:,0],y=projection[:,1],hue=df.cluster.astype(str),alpha=.6)
+plt.title('Audio clusters: PCA visualization (not a validation metric)')
+plt.xlabel('PC1');plt.ylabel('PC2');plt.tight_layout();plt.show()
+fig, axes = plt.subplots(1,2,figsize=(12,4))
+sns.boxplot(data=df,x='cluster',y='longevity_score',ax=axes[0]);axes[0].set_title('Longevity by audio cluster')
+sns.boxplot(data=df,x='cluster',y='total_streams_mil',showfliers=False,ax=axes[1]);axes[1].set_title('Streams by audio cluster')
+plt.tight_layout();plt.show()
+```
+
+**Interpretation caution:** Differences in outcome means across clusters are descriptive and may reflect confounding by genre, release year, promotion, and artist popularity. A cluster label is not an independent causal driver of success.
+
+
+
+
+
+## RQ5 — K-Means Clustering: Results and Interpretation
+
+### Cluster Selection
+
+K-Means clustering was performed using six standardized audio features: tempo, danceability, energy, valence, acousticness, and liveness. The number of clusters was evaluated from k = 2 to k = 10 using inertia, silhouette scores, and minimum cluster size.
+
+The highest silhouette score was 0.1399 at k = 9. However, the elbow-based selection procedure identified k = 4 as a suitable candidate. Its silhouette score of 0.1336 was only 0.0063 below the maximum, within the predefined tolerance of 0.02.
+
+All candidate solutions satisfied the minimum cluster size requirement of 2% of the dataset. Therefore, k = 4 was selected as a balance between cluster compactness, separation, and interpretability.
+
+The relatively low silhouette scores across all candidate values indicate weak natural separation in the audio feature space. Consequently, the resulting clusters should be interpreted as exploratory musical profiles rather than clearly distinct categories.
+
+### Cluster Profiles
+
+The final K-Means solution divided the 1,200 tracks into four clusters.
+
+**Cluster 0 — High-Energy, Low-Valence Tracks (381 tracks):** This group exhibited relatively high energy (0.665) and the lowest valence (0.317), suggesting energetic but less positively valenced musical characteristics.
+
+**Cluster 1 — Danceable, Acoustic-Leaning Tracks (238 tracks):** This cluster had the highest danceability (0.685) and acousticness (0.506), combined with the lowest energy (0.543).
+
+**Cluster 2 — High-Liveness Tracks (257 tracks):** This group was distinguished by substantially higher liveness (0.436) than the other clusters, indicating stronger live-performance-related audio characteristics.
+
+**Cluster 3 — Upbeat, High-Energy Tracks (324 tracks):** This cluster exhibited the highest valence (0.750) and energy (0.687), together with relatively high danceability (0.678) and low acousticness (0.150).
+
+The PCA visualization showed substantial overlap between clusters, consistent with the low silhouette scores. Since PCA reduces the original six-dimensional feature space to two dimensions, the visualization should be interpreted as an exploratory representation rather than a definitive measure of clustering quality.
+
+### Commercial Performance Across Clusters
+
+Commercial success variables were excluded from the clustering process and examined only after the clusters were formed.
+
+Cluster 0 had the highest average total streams (311.453 million), while Cluster 1 had the longest average chart presence (23.567 weeks) and highest viral-hit rate (30.7%).
+
+Cluster 3 exhibited the highest average longevity score (0.289) and the best average peak chart rank (49.710), where lower rank values indicate stronger chart performance.
+
+Cluster 2 had relatively lower streaming totals, longevity scores, and viral-hit rates compared with the other groups.
+
+Despite these differences, commercial performance was broadly similar across clusters. The difference between the highest and lowest mean streaming totals was approximately 13.76 million streams, while the range of average longevity scores was only 0.011.
+
+These descriptive differences do not establish statistical significance or causal relationships between audio profiles and commercial success.
+
+### Conclusion
+
+The K-Means analysis identified four interpretable audio profiles, but the low silhouette scores and overlapping PCA representation indicate weak overall cluster separation.
+
+Although the clusters differed in their average audio characteristics, their commercial performance measures were relatively similar.
+
+The findings suggest that audio characteristics can support exploratory segmentation of songs, but the resulting segments do not reveal strong differences in commercial success within this dataset.
+
+This conclusion is consistent with the supervised learning results, in which audio and metadata features provided limited improvements over baseline models for predicting chart longevity, peak chart rank, and total streaming volume.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# 11. Cross-Question Summary
+
+```{python}
+# Section 11 — Final Model Summary
+
+import pandas as pd
+import numpy as np
+
+# 11.1 Supervised Learning Summary
+# Regression models: selected by lowest CV MAE.
+# Classification model: report both PR-AUC and ROC-AUC.
+
+summary_rows = []
+
+for rq_label, result, unit in [
+    ("RQ1 — Chart Longevity", rq1, "Longevity score"),
+    ("RQ3 — Peak Chart Rank", rq3, "Rank positions"),
+    ("RQ4 — Total Streams", rq4, "Million streams")
+]:
+    comparison = result["comparison"]
+    winner = comparison.loc[
+        comparison["Model"] == result["best_name"]
+    ].iloc[0]
+
+    summary_rows.append({
+        "Research Question": rq_label,
+        "Task": "Regression",
+        "Selected Model": result["best_name"],
+        "Primary Metric": "CV MAE",
+        "CV Primary Score": winner["CV MAE"],
+        "CV Secondary Score": winner["CV RMSE"],
+        "Test MAE": result["test_mae"],
+        "Test R2": result["test_r2"],
+        "Unit": unit
+    })
+
+# RQ2: Binary classification
+if rq2 is not None:
+    rq2_comparison = rq2["comparison"]
+
+    rq2_winner = rq2_comparison.loc[
+        rq2_comparison["Model"] == rq2["best_name"]
+    ].iloc[0]
+
+    summary_rows.append({
+        "Research Question": "RQ2 — Viral Hit",
+        "Task": "Binary Classification",
+        "Selected Model": rq2["best_name"],
+        "Primary Metric": "CV PR-AUC",
+        "CV Primary Score": rq2_winner["CV PR-AUC"],
+        "CV Secondary Score": rq2_winner["CV ROC-AUC"],
+        "Test MAE": np.nan,
+        "Test R2": np.nan,
+        "Unit": "Score (0–1)"
+    })
+
+final_model_summary = pd.DataFrame(summary_rows)
+
+rq_order = [
+    "RQ1 — Chart Longevity",
+    "RQ2 — Viral Hit",
+    "RQ3 — Peak Chart Rank",
+    "RQ4 — Total Streams"
+]
+
+final_model_summary["Research Question"] = pd.Categorical(
+    final_model_summary["Research Question"],
+    categories=rq_order,
+    ordered=True
+)
+
+final_model_summary = (
+    final_model_summary
+    .sort_values("Research Question")
+    .reset_index(drop=True)
+)
+
+print("FINAL SUPERVISED LEARNING SUMMARY")
+display(final_model_summary.round(4))
+
+
+# 11.2 RQ5 Clustering Summary
+
+selected_cluster_row = k_table.loc[
+    k_table["k"] == selected_k
+].iloc[0]
+
+clustering_summary = pd.DataFrame([{
+    "Research Question": "RQ5 — Audio Profiles",
+    "Task": "Clustering",
+    "Selected Model": "K-Means",
+    "Selected k": selected_k,
+    "Silhouette Score": selected_cluster_row["silhouette"],
+    "Inertia": selected_cluster_row["inertia"],
+    "Smallest Cluster": selected_cluster_row["smallest_cluster"]
+}])
+
+print("\nFINAL CLUSTERING SUMMARY")
+display(clustering_summary.round(4))
+
+print("\nCLUSTER SIZES")
+display(
+    df["cluster"]
+    .value_counts()
+    .sort_index()
+    .rename("Number of Tracks")
+    .to_frame()
+)
+
+
+# 11.3 Model Selection and Baseline Comparison
+
+print("\nBASELINE COMPARISON")
+
+for label, result in [
+    ("RQ1", rq1),
+    ("RQ3", rq3),
+    ("RQ4", rq4)
+]:
+    comp = result["comparison"]
+
+    baseline_mae = comp.loc[
+        comp["Model"] == "Dummy median", "CV MAE"
+    ].iloc[0]
+
+    selected_mae = comp.loc[
+        comp["Model"] == result["best_name"], "CV MAE"
+    ].iloc[0]
+
+    print(
+        f"{label}: Selected = {result['best_name']} | "
+        f"Selected CV MAE = {selected_mae:.4f} | "
+        f"Baseline CV MAE = {baseline_mae:.4f} | "
+        f"Improvement = {baseline_mae - selected_mae:.4f}"
+    )
+
+if rq2 is not None:
+    comp = rq2["comparison"]
+
+    baseline_ap = comp.loc[
+        comp["Model"] == "Dummy prior", "CV PR-AUC"
+    ].iloc[0]
+
+    selected_ap = comp.loc[
+        comp["Model"] == rq2["best_name"], "CV PR-AUC"
+    ].iloc[0]
+
+    print(
+        f"RQ2: Selected = {rq2['best_name']} | "
+        f"Selected CV PR-AUC = {selected_ap:.4f} | "
+        f"Baseline CV PR-AUC = {baseline_ap:.4f} | "
+        f"Difference = {selected_ap - baseline_ap:.4f}"
+    )
+
+
+
+# 11.4 Supplementary Ridge Feature Importance
+
+print("\nSUPPLEMENTARY RIDGE FEATURE IMPORTANCE")
+
+# Check which supplementary importance tables are available
+importance_sources = [
+    ("RQ1 — Longevity", "rq1_feature_importance"),
+    ("RQ3 — Peak Rank", "rq3_feature_importance"),
+    ("RQ4 — Streams", "rq4_feature_importance")
+]
+
+importance_summary_rows = []
+
+for rq_label, variable_name in importance_sources:
+
+    importance_df = globals().get(variable_name)
+
+    if importance_df is None:
+        print(
+            f"Skipped {rq_label}: "
+            f"{variable_name} has not been created."
+        )
+        continue
+
+    required_columns = [
+        "Feature",
+        "Mean Score Decrease",
+        "Std"
+    ]
+
+    if not all(
+        col in importance_df.columns
+        for col in required_columns
+    ):
+        print(
+            f"Skipped {rq_label}: "
+            "importance table has unexpected columns."
+        )
+        continue
+
+    top_features = (
+        importance_df
+        .sort_values(
+            "Mean Score Decrease",
+            ascending=False
+        )
+        .head(3)
+    )
+
+    for rank, (_, row) in enumerate(
+        top_features.iterrows(),
+        start=1
+    ):
+        importance_summary_rows.append({
+            "Research Question": rq_label,
+            "Model": "Ridge (Supplementary)",
+            "Rank": rank,
+            "Feature": row["Feature"],
+            "Mean Score Decrease": row["Mean Score Decrease"],
+            "Std": row["Std"]
+        })
+
+if importance_summary_rows:
+
+    supplementary_importance_summary = pd.DataFrame(
+        importance_summary_rows
+    )
+
+    display(
+        supplementary_importance_summary.round(6)
+    )
+
+else:
+    print(
+        "No supplementary Ridge importance tables "
+        "are currently available."
+    )
+
+print(
+    "\nInterpretation note: Ridge feature importance "
+    "is exploratory because Ridge did not outperform "
+    "the Dummy Median baseline in RQ1, RQ3, or RQ4."
+)
+```
+
