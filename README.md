@@ -32,21 +32,11 @@ in a reproducible Python/Quarto workflow.
 The project uses three CSV files, joined by the unique `track_id`
 identifier:
 
-  -----------------------------------------------------------------------
-  File                                Role
-  ----------------------------------- -----------------------------------
-  `track_metadata.csv`                Track metadata, genre, release
-                                      information, duration, and
-                                      explicit-content indicator
-
-  `audio_features.csv`                Musical characteristics such as
-                                      tempo, danceability, energy,
-                                      valence, acousticness, and liveness
-
-  `chart_longevity_panel.csv`         Commercial outcomes, including
-                                      chart rank, chart longevity,
-                                      streams, and viral-hit labels
-  -----------------------------------------------------------------------
+| File | Role |
+|---|---|
+| `track_metadata.csv` | Track metadata, genre, release information, duration, and explicit-content indicator |
+| `audio_features.csv` | Musical characteristics such as tempo, danceability, energy, valence, acousticness, and liveness |
+| `chart_longevity_panel.csv` | Commercial outcomes, including chart rank, chart longevity, streams, and viral-hit labels |
 
 The workflow checks identifier uniqueness, reports unmatched IDs, and
 performs a validated one-to-one inner merge. The resulting analysis
@@ -92,22 +82,10 @@ characteristics and commercial outcomes.
 
 Each supervised task compares five candidate models, including a simple
 baseline:
-
-  -----------------------------------------------------------------------
-  Task                    Candidate models        Main evaluation
-  ----------------------- ----------------------- -----------------------
-  Regression (RQ1, RQ3,   Dummy Median, Ridge,    Cross-validation MAE;
-  RQ4)                    Random Forest, Extra    RMSE as secondary
-                          Trees,                  
-                          HistGradientBoosting    
-
-  Binary classification   Dummy Prior, Logistic   PR-AUC and ROC-AUC;
-  (RQ2)                   Regression, Random      threshold-based metrics
-                          Forest, Extra Trees,    
-                          HistGradientBoosting    
-  -----------------------------------------------------------------------
-
-
+| Task | Candidate Models | Main Evaluation |
+|---|---|---|
+| Regression (RQ1, RQ3, RQ4) | Dummy Median, Ridge, Random Forest, Extra Trees, HistGradientBoosting | CV MAE (primary), CV RMSE (secondary) |
+| Binary Classification (RQ2) | Dummy Prior, Logistic Regression, Random Forest, Extra Trees, HistGradientBoosting | CV PR-AUC (primary), CV ROC-AUC (secondary), Precision, Recall, F1 |
 ### Unsupervised Learning (RQ5)
 
 K-Means clustering uses six standardized audio features:
